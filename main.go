@@ -40,33 +40,6 @@ func main() {
 	} else {
 		server(&context{conf: &conf, tun: tun})
 	}
-	listenAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%v", conf.RemoteIP, conf.Port))
-	if err != nil {
-		log.Panicln("Cannot resolve server address:", err)
-	}
-	listen, err := net.ListenUDP("udp4", listenAddr)
-	if err != nil {
-		log.Panicln("Cannot listen:", err)
-	}
-	defer listen.Close()
-	go func() {
-		buffer := make([]byte, 2048)
-		for {
-			n, err := tun.Read(buffer)
-			if err != nil {
-				log.Panicln("Cannot read from buffer:", err)
-			}
-			listen.WriteToUDP(buffer, listenAddr)
-		}
-	}()
-	packet := make([]byte, 2000)
-	for {
-		n, err := tun.Read(packet)
-		if err != nil {
-			log.Panicln("Error while reading from TUN device:", err)
-		}
-
-	}
 }
 
 func parseConf() config {
@@ -98,27 +71,29 @@ func createTUN() *water.Interface {
 }
 
 func updateRoutingTable(name string, conf *config) {
-	localTUNIP := "10.8.0.1"
-	err := exec.Command("ifconfig", name, localTUNIP, "mtu", conf.MTU, "up").Run()
-	if err != nil {
-		log.Panicln("Cannot bind IP address of TUN interface:", name)
-	}
-	err = exec.Command("sysctl", "-w", "net.inet.ip.forwarding=1").Run()
+	err := exec.Command("sysctl", "-w", "net.inet.ip.forwarding=1").Run()
 	if err != nil {
 		log.Panicln("Cannot change sysctl ip forwarding preference")
 	}
-	defaultGatewayIP := getDefaultGatewayIP(name)
-	err = exec.Command("route", "add", conf.RemoteIP, defaultGatewayIP).Run()
+	localTUNIP := "10.8.0.1"
+	err = exec.Command("ifconfig", name, localTUNIP, "mtu", conf.MTU, "up").Run()
 	if err != nil {
-		log.Panicln("Cannot add route info:", err)
+		log.Panicln("Cannot bind IP address of TUN interface:", name)
 	}
-	err = exec.Command("route", "add", "0/1", localTUNIP).Run()
-	if err != nil {
-		log.Panicln("Cannot assign routing rule:", err)
-	}
-	err = exec.Command("route", "add", "128/1", localTUNIP).Run()
-	if err != nil {
-		log.Panicln("Cannot assign routing rule:", err)
+	if conf.IsClient {
+		defaultGatewayIP := getDefaultGatewayIP(name)
+		err = exec.Command("route", "add", conf.RemoteIP, defaultGatewayIP).Run()
+		if err != nil {
+			log.Panicln("Cannot add route info:", err)
+		}
+		err = exec.Command("route", "add", "0/1", localTUNIP).Run()
+		if err != nil {
+			log.Panicln("Cannot assign routing rule:", err)
+		}
+		err = exec.Command("route", "add", "128/1", localTUNIP).Run()
+		if err != nil {
+			log.Panicln("Cannot assign routing rule:", err)
+		}
 	}
 }
 
@@ -149,10 +124,12 @@ func registerSignalHandler(remoteIP string) {
 	}()
 }
 
-func restoreRoutingTable(external string) {
-	exec.Command("route", "delete", external).Run()
-	exec.Command("route", "delete", "0/1")
-	exec.Command("route", "delete", "128/1")
+func restoreRoutingTable(conf *config) {
+	if conf.IsClient {
+		exec.Command("route", "delete", conf.RemoteIP).Run()
+		exec.Command("route", "delete", "0/1").Run()
+		exec.Command("route", "delete", "128/1").Run()
+	}
 }
 
 func getDefaultGatewayIP(name string) string {
@@ -173,14 +150,15 @@ func client(ctxt *context) {
 	remote := conf.RemoteIP
 	port := conf.Port
 	remoteAddrStr := fmt.Sprintf("%s:%d", remote, port)
-	remoteAddr, err := net.ResolveUDPAddr("udp", remoteAddrStr)
+	remoteAddr, err := net.ResolveTCPAddr("tcp", remoteAddrStr)
 	if err != nil {
 		log.Panicln("Cannot resolve server address:", remoteAddrStr)
 	}
-	conn, err := net.DialUDP("udp", nil, remoteAddr)
+	conn, err := net.DialTCP("udp", nil, remoteAddr)
 	if err != nil {
 		log.Panicln("Cannot dial server:", err)
 	}
+	defer conn.Close()
 	buf := make([]byte, bufferSize)
 	for {
 		n, err := tun.Read(buf)
@@ -188,16 +166,41 @@ func client(ctxt *context) {
 			log.Panicln("Cannot read from TUN device")
 		}
 		// TODO: 여기서 암호화 진행하기
-		for n > 0 {
-			written, err := conn.Write(buf)
-			if err != nil {
-				log.Panicln("Cannot write to server")
-			}
-			n -= written
+		_, err := conn.Write(buf[:n])
+		if err != nil {
+			log.Panicln("Cannot write to server")
+		}
+		n, err = conn.Read(buf)
+		if err != nil {
+			log.Panicln("Cannot read from server")
+		}
+		// TODO: 여기서 복호화 진행하기
+		_, err := tun.Write(buf[:n])
+		if err != nil {
+			log.Panicln("Cannot write to TUN")
 		}
 	}
 }
 
 func server(ctxt *context) {
-
+	tun := ctxt.tun
+	conf := ctxt.conf
+	port := conf.Port
+	listenAddrStr := fmt.Sprintf("0.0.0.0:%d", port)
+	listenAddr, err := net.ResolveTCPAddr("tcp", listenAddrStr)
+	if err != nil {
+		log.Panicln("Cannot resolve listen address:", listenAddrStr)
+	}
+	listenSock, err := net.ListenTCP("tcp", listenAddr)
+	if err != nil {
+		log.Panicln("Cannot listen:", err)
+	}
+	defer listenSock.Close()
+	buf := make([]byte, bufferSize)
+	for {
+		client, err := listenSock.AcceptTCP()
+		if err != nil {
+			log.Panicln("Cannot accept client connection:", err)
+		}
+	}
 }
